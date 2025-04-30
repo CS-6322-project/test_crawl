@@ -13,6 +13,7 @@ import nltk
 
 nltk.download('stopwords', quiet=True)
 DATA_FOLDER = "indexing/project_output"
+
 class SearchEngine:
     def __init__(self, data_folder=DATA_FOLDER):
         # Initialize the Porter Stemmer and stopwords
@@ -28,8 +29,8 @@ class SearchEngine:
         self.query_history = {}
         self.relevance_feedback = {}
         
-        # For association clusters
-        self.term_co_occurrence = None  
+        # For association clusters - no precomputed co-occurrence matrix
+        self.term_co_occurrence_cache = {}  # Cache for query-specific matrices
         
         # Pre-computed clusters (will be initialized on first use)
         self.document_vectors = None
@@ -165,55 +166,76 @@ class SearchEngine:
         else:
             return 0.0
     
-    def _build_term_co_occurrence(self):
-        """Build term co-occurrence matrix for association clusters (optimized version)"""
-        print("Building term co-occurrence matrix for association clusters...")
+    def _build_term_co_occurrence_for_query(self, query_tokens):
+        """Build term co-occurrence matrix specifically for this query"""
+        print("Building targeted co-occurrence matrix for query terms...")
         co_occurrence = defaultdict(Counter)
         
-        # Get top 5000 most common terms to limit matrix size (significantly improves performance)
+        # Get a cache key for this query (sorted query tokens)
+        cache_key = tuple(sorted(query_tokens))
+        
+        # Check if we have a cached matrix for this query
+        if cache_key in self.term_co_occurrence_cache:
+            print("Using cached co-occurrence matrix for this query")
+            return self.term_co_occurrence_cache[cache_key]
+        
+        # Find documents that contain at least one query term
+        matching_docs = self.get_matching_docs(query_tokens)
+        print(f"Found {len(matching_docs)} documents containing query terms")
+        
+        # Limit document sample size for very large result sets
+        max_docs = 5000
+        if len(matching_docs) > max_docs:
+            print(f"Sampling {max_docs} documents out of {len(matching_docs)} matches")
+            matching_docs = set(random.sample(list(matching_docs), max_docs))
+        
+        # Get most common terms for efficiency
         term_doc_frequency = Counter()
         for term, doc_list in self.inverted_index.items():
-            term_doc_frequency[term] = len(set(doc_list))
+            # Only count frequency in matching docs
+            term_doc_frequency[term] = len(set(doc_list).intersection(matching_docs))
         
-        common_terms = set([term for term, _ in term_doc_frequency.most_common(5000)])
+        # Take top terms plus ensure query terms are included
+        common_terms = set([term for term, _ in term_doc_frequency.most_common(3000)])
+        for term in query_tokens:
+            common_terms.add(term)
         
-        # Sample a subset of documents (10%) for large datasets
-        doc_count = len(self.tf_idf)
-        sample_size = min(3000, doc_count)  # Cap at 3000 documents or fewer
-        sample_ratio = sample_size / doc_count
-        
-        if doc_count > 10000:  # Only sample for large datasets
-            print(f"Using {sample_size} documents ({sample_ratio:.1%} sample) for co-occurrence matrix")
-            doc_ids = random.sample(list(self.tf_idf.keys()), sample_size)
-        else:
-            doc_ids = list(self.tf_idf.keys())
-        
-        # Process documents with optimization for large documents
-        for i, doc_id in enumerate(doc_ids):
+        # Process matching documents
+        for i, doc_id in enumerate(matching_docs):
             if i % 1000 == 0 and i > 0:
-                print(f"Processed {i}/{len(doc_ids)} documents for co-occurrence matrix...")
+                print(f"Processed {i}/{len(matching_docs)} documents for co-occurrence matrix...")
             
             # Get terms from the document, filtering to common terms only
-            doc_terms = [term for term in self.tf_idf[doc_id].keys() if term in common_terms]
-            
-            # Limit terms per document to avoid quadratic explosion
-            if len(doc_terms) > 100:
-                doc_terms = random.sample(doc_terms, 100)
-            
-            # Build co-occurrence counts
-            for i, term1 in enumerate(doc_terms):
-                for term2 in doc_terms[i+1:]:
-                    co_occurrence[term1][term2] += 1
-                    co_occurrence[term2][term1] += 1
+            if doc_id in self.tf_idf:
+                doc_terms = [term for term in self.tf_idf[doc_id].keys() if term in common_terms]
+                
+                # Limit terms per document to avoid quadratic explosion
+                if len(doc_terms) > 100:
+                    # Make sure query terms stay in the sample
+                    query_terms_in_doc = [t for t in query_tokens if t in doc_terms]
+                    other_terms = [t for t in doc_terms if t not in query_tokens]
+                    # Sample from other terms
+                    if len(other_terms) > (100 - len(query_terms_in_doc)):
+                        other_terms = random.sample(other_terms, 100 - len(query_terms_in_doc))
+                    doc_terms = query_terms_in_doc + other_terms
+                
+                # Build co-occurrence counts
+                for i, term1 in enumerate(doc_terms):
+                    for term2 in doc_terms[i+1:]:
+                        co_occurrence[term1][term2] += 1
+                        co_occurrence[term2][term1] += 1
         
-        print("Co-occurrence matrix built.")
+        print(f"Co-occurrence matrix built with {len(co_occurrence)} terms.")
+        
+        # Cache the result for future use with this query
+        self.term_co_occurrence_cache[cache_key] = co_occurrence
+        
+        # Limit cache size to avoid memory issues
+        if len(self.term_co_occurrence_cache) > 20:  # Keep only 20 most recent matrices
+            oldest_key = next(iter(self.term_co_occurrence_cache))
+            del self.term_co_occurrence_cache[oldest_key]
+        
         return co_occurrence
-    
-    def _get_term_co_occurrence(self):
-        """Lazy loading of the term co-occurrence matrix"""
-        if self.term_co_occurrence is None:
-            self.term_co_occurrence = self._build_term_co_occurrence()
-        return self.term_co_occurrence
     
     def _create_document_vectors(self):
         """Create vector representation of documents for clustering"""
@@ -326,10 +348,11 @@ class SearchEngine:
         
         This method finds terms that frequently co-occur with query terms
         """
-        # Lazy load the co-occurrence matrix
-        term_co_occurrence = self._get_term_co_occurrence()
-        
         query_tokens = self.preprocess_query(query_text)
+        
+        # Build co-occurrence matrix just for this query
+        term_co_occurrence = self._build_term_co_occurrence_for_query(query_tokens)
+        
         expansion_terms = Counter()
         
         # For each query term, find associated terms
